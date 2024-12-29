@@ -1,36 +1,20 @@
 # sequence-compression
 
-Testing if neural networks can learn to encode complete sequences (including word order) in single vectors, enabling parallel text generation instead of word-by-word generation.
+Testing if neural networks can learn to encode complete sequences (including word order) in single vectors, enabling parallel text generation (one-shot) instead of sequential generation (word-by-word, auto-regressive).
 
 ## Results Summary
 
-We tested whether we can generate sequences in parallel by compressing them into vectors that encode both content and order. Key findings after a week of experiments:
-
-1. It works, with clear limitations:
-
-    - Sequences up to length 4: >95% accuracy
-    - Length 5-6: Rapidly degrading performance
-    - Length 7+: Complete breakdown
-
-2. Speed vs. Accuracy tradeoff:
-
-    - Parallel generation is 3x faster for short sequences
-    - Standard word-by-word is more reliable for longer text
-    - Sweet spot: 3-4 word phrases
-
-3. Vector Analysis:
-    - Order information creates clear geometric patterns
-    - Content and order compete for vector capacity
-    - Longer sequences cause increasing entanglement
+In-progress.
 
 ## Usage
 
 ```bash
 # Install dependencies
-pip install torch numpy matplotlib
+pip install -r requirements.txt
 
 # Run experiments
-python sequence_compression.py
+python download_openwebtext.py
+python sequence_compressor.py
 ```
 
 ## Analysis & Future Work
