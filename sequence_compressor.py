@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import IterableDataset, DataLoader
@@ -9,10 +10,10 @@ import gensim.downloader as api
 
 
 batch_size = 16
-max_len = 128
-n_latent = 64
-min_freq = 8
+max_len = 32
+n_latent = 16
 n_epochs = 1
+train_percent = 0.01
 
 
 class TextDataset(IterableDataset):
@@ -26,7 +27,7 @@ class TextDataset(IterableDataset):
             with open(self.path) as f:
                 for line in f:
                     tokens = line.strip().split()
-                    if 4 <= len(tokens) <= self.max_len:
+                    if len(tokens) <= self.max_len:
                         x = [self.vocab.get(t, self.vocab["<unk>"]) for t in tokens]
                         if len(x) < self.max_len:
                             x = x + [self.vocab["<pad>"]] * (self.max_len - len(x))
@@ -88,19 +89,23 @@ class Compressor(nn.Module):
         return self.out(h)
 
 
-def load_pretrained_embeddings(max_vocab_size=10000):
-    # Load pre-trained word vectors
-    word_vectors = api.load("word2vec-google-news-300")
+def load_pretrained_embeddings():
+    word_vectors = api.load("glove-wiki-gigaword-100")
+    vocab = {
+        "<pad>": 0,  # Index 0 reserved for padding
+        "<unk>": 1,  # Index 1 reserved for unknown words
+    }
 
-    # Create vocab from embeddings
-    vocab = {"<pad>": 0, "<unk>": 1}  # Special tokens
+    word_vectors.add_vector("<pad>", np.zeros(word_vectors.vector_size))
 
-    # Add words from embeddings to vocab
+    unk_vector = np.mean(
+        [word_vectors[word] for word in word_vectors.index_to_key[:1000]], axis=0
+    )
+    word_vectors.add_vector("<unk>", unk_vector)
+
     for word in word_vectors.index_to_key:
-        if len(vocab) < max_vocab_size:
+        if word not in vocab:
             vocab[word] = len(vocab)
-        else:
-            break
 
     return vocab, word_vectors
 
@@ -128,7 +133,9 @@ def main():
         rev_vocab = {v: k for k, v in vocab.items()}
 
         print(f"training on {device}")
-        steps_per_epoch = dataset.count_lines() // batch_size
+        steps_per_epoch = math.floor(
+            dataset.count_lines() // batch_size * train_percent
+        )
 
         for epoch in range(n_epochs):
             # Track stats

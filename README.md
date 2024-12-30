@@ -1,12 +1,15 @@
 # sequence-compression
 
-Testing if neural networks can learn to encode complete sequences (including word order) in single vectors, enabling parallel text generation (one-shot) instead of sequential generation (word-by-word, auto-regressive).
+Hypothesis - neural networks can learn to encode positional embeddings (i.e. sequences of words) into latent space vectors, enabling all-at-once answer generation instead of sequential, auto-regressive token generation.
 
-## Results Summary
+## status
 
-In-progress.
+Work in progress:
 
-## Usage
+1. Implement proper train, validation, test partitions
+2. Up batch size and train on larger GPU
+
+## usage
 
 ```bash
 # Install dependencies
@@ -16,22 +19,3 @@ pip install -r requirements.txt
 python download_openwebtext.py
 python sequence_compressor.py
 ```
-
-## Analysis & Future Work
-
-1. Why it works for short sequences:
-
-    - Vector capacity sufficient for small content + order
-    - Clean geometric separation of orderings
-    - Fast parallel generation
-
-2. Why it fails for longer sequences:
-
-    - Vector capacity saturates
-    - Order information gets entangled
-    - Error compounds across positions
-
-3. Potential improvements:
-    - Hierarchical compression for longer sequences
-    - Sparse vector representations
-    - Separate content/order spaces
