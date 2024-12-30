@@ -1,264 +1,238 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, IterableDataset
-from typing import List, Dict, Optional
+from torch.utils.data import IterableDataset, DataLoader
 from pathlib import Path
-import numpy as np
 from tqdm import tqdm
-import json
-import readline  # For better CLI input handling
+import numpy as np
+import argparse
+import gensim.downloader as api
 
 
-class StreamingTextDataset(IterableDataset):
-    """Memory efficient dataset for large text files"""
+batch_size = 16
+max_len = 128
+n_latent = 64
+min_freq = 8
+n_epochs = 1
 
-    def __init__(self, data_path: str, vocab: Dict[str, int], max_len: int):
-        self.data_path = Path(data_path)
+
+class TextDataset(IterableDataset):
+    def __init__(self, path, vocab, max_len):
+        self.path = path
         self.vocab = vocab
         self.max_len = max_len
-        self.pad_token = 0
 
     def __iter__(self):
-        with open(self.data_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    # Tokenize and convert to indices
-                    words = line.strip().split()[: self.max_len]
-                    indices = [
-                        self.vocab.get(word, self.vocab["<UNK>"]) for word in words
-                    ]
+        while True:
+            with open(self.path) as f:
+                for line in f:
+                    tokens = line.strip().split()
+                    if 4 <= len(tokens) <= self.max_len:
+                        x = [self.vocab.get(t, self.vocab["<unk>"]) for t in tokens]
+                        if len(x) < self.max_len:
+                            x = x + [self.vocab["<pad>"]] * (self.max_len - len(x))
+                        yield torch.tensor(x)
 
-                    # Pad sequence
-                    if len(indices) < self.max_len:
-                        indices = indices + [self.pad_token] * (
-                            self.max_len - len(indices)
-                        )
-
-                    tensor = torch.tensor(indices)
-                    yield tensor, tensor
+    def count_lines(self):
+        return sum(1 for _ in open(self.path))
 
 
-class SequenceCompressor(nn.Module):
-    """Neural model for one-shot sequence compression and generation"""
-
-    def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int = 512,
-        latent_size: int = 256,
-        max_len: int = 20,
-        num_layers: int = 2,
-    ):
+class Compressor(nn.Module):
+    def __init__(self, vocab_size, n_latent, max_len, vocab, word_vectors):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.latent_size = latent_size
+        n_dims = word_vectors.vector_size
+
         self.max_len = max_len
+        self.vocab_size = vocab_size
 
-        # Embedding with position encoding
-        self.embed = nn.Embedding(vocab_size, hidden_size)
-        self.pos_encoding = nn.Parameter(torch.randn(1, max_len, hidden_size))
+        embedding_matrix = torch.zeros((vocab_size, n_dims))
 
-        # Encoder layers
-        encoder_layers = []
-        curr_size = hidden_size * max_len
-        for _ in range(num_layers):
-            encoder_layers.extend(
-                [
-                    nn.Linear(curr_size, curr_size // 2),
-                    nn.LayerNorm(curr_size // 2),
-                    nn.GELU(),
-                    nn.Dropout(0.1),
-                ]
-            )
-            curr_size = curr_size // 2
-        encoder_layers.append(nn.Linear(curr_size, latent_size))
-        self.encoder = nn.Sequential(*encoder_layers)
+        for word, idx in vocab.items():
+            if word in ["<pad>", "<unk>"]:
+                embedding_matrix[idx] = torch.zeros(n_dims)
+            elif word in word_vectors:
+                embedding_matrix[idx] = torch.tensor(word_vectors[word])
+            else:
+                nn.init.xavier_uniform_(embedding_matrix[idx].unsqueeze(0))
 
-        # Decoder layers
-        decoder_layers = []
-        curr_size = latent_size
-        for _ in range(num_layers):
-            decoder_layers.extend(
-                [
-                    nn.Linear(curr_size, curr_size * 2),
-                    nn.LayerNorm(curr_size * 2),
-                    nn.GELU(),
-                    nn.Dropout(0.1),
-                ]
-            )
-            curr_size = curr_size * 2
-        self.decoder = nn.Sequential(*decoder_layers)
+        self.embed = nn.Embedding.from_pretrained(embedding_matrix, freeze=False)
 
-        self.out = nn.Linear(hidden_size, vocab_size)
+        pos = torch.arange(max_len).unsqueeze(1).float()
+        pe = torch.zeros(1, max_len, n_dims)
+        div = torch.exp(torch.arange(0, n_dims, 2) * -(np.log(10000.0) / n_dims))
+        pe[0, :, 0::2] = torch.sin(pos * div)
+        pe[0, :, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe)
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size = x.size(0)
-        # Add positional encoding
-        embedded = self.embed(x) + self.pos_encoding
-        flat = embedded.view(batch_size, -1)
-        return self.encoder(flat)
+        self.encoder = nn.Sequential(
+            nn.Linear(n_dims * max_len, n_dims * 2),
+            nn.LayerNorm(n_dims * 2),
+            nn.ReLU(),
+            nn.Linear(n_dims * 2, n_latent),
+        )
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        batch_size = z.size(0)
-        hidden = self.decoder(z)
-        hidden = hidden.view(batch_size, self.max_len, self.hidden_size)
-        return self.out(hidden)
+        self.decoder = nn.Sequential(
+            nn.Linear(n_latent, n_dims * 2),
+            nn.LayerNorm(n_dims * 2),
+            nn.ReLU(),
+            nn.Linear(n_dims * 2, n_dims * max_len),
+        )
+        self.out = nn.Linear(n_dims, vocab_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.encode(x)
-        return self.decode(z)
+    def forward(self, x):
+        b, t = x.size()
+        h = self.embed(x) + self.pe
+        h = h.view(b, -1)
+        z = self.encoder(h)
+        h = self.decoder(z)
+        h = h.view(b, t, -1)
+        return self.out(h)
 
 
-def build_vocabulary(
-    data_path: str, min_freq: int = 5, max_vocab: int = 50000
-) -> Dict[str, int]:
-    """Build vocabulary from data file with frequency threshold"""
-    word_freq = {}
+def load_pretrained_embeddings(max_vocab_size=10000):
+    # Load pre-trained word vectors
+    word_vectors = api.load("word2vec-google-news-300")
 
-    with open(data_path, "r", encoding="utf-8") as f:
-        for line in tqdm(f, desc="Building vocabulary"):
-            for word in line.strip().split():
-                word_freq[word] = word_freq.get(word, 0) + 1
+    # Create vocab from embeddings
+    vocab = {"<pad>": 0, "<unk>": 1}  # Special tokens
 
-    # Filter and sort by frequency
-    vocab = {"<PAD>": 0, "<UNK>": 1}
-    idx = 2
-
-    for word, freq in sorted(word_freq.items(), key=lambda x: (-x[1], x[0])):
-        if freq >= min_freq and len(vocab) < max_vocab:
-            vocab[word] = idx
-            idx += 1
-
-    return vocab
-
-
-def train_model(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: Optional[DataLoader] = None,
-    epochs: int = 10,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> None:
-    """Train the sequence compression model"""
-    model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-    scheduler = torch.optim.CosineAnnealingLR(optimizer, epochs)
-
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0
-
-        for batch, target in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            batch, target = batch.to(device), target.to(device)
-            optimizer.zero_grad()
-
-            output = model(batch)
-            loss = F.cross_entropy(
-                output.view(-1, model.vocab_size), target.view(-1), ignore_index=0
-            )
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-            train_loss += loss.item()
-
-        train_loss /= len(train_loader)
-        print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}")
-        scheduler.step()
-
-
-def interactive_inference(
-    model: nn.Module,
-    vocab: Dict[str, int],
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> None:
-    """Interactive CLI for testing one-shot sequence generation"""
-    model.eval()
-    rev_vocab = {v: k for k, v in vocab.items()}
-
-    print("\nOne-Shot Sequence Generation")
-    print("Enter a sequence (or 'quit' to exit):")
-
-    while True:
-        try:
-            sequence = input("\n> ").strip()
-            if sequence.lower() == "quit":
-                break
-
-            # Tokenize input
-            words = sequence.split()[: model.max_len]
-            indices = [vocab.get(word, vocab["<UNK>"]) for word in words]
-            if len(indices) < model.max_len:
-                indices = indices + [0] * (model.max_len - len(indices))
-
-            # Generate
-            x = torch.tensor(indices).unsqueeze(0).to(device)
-            with torch.no_grad():
-                z = model.encode(x)
-                output = model.decode(z)
-                pred_indices = output[0].argmax(dim=-1)
-
-                pred_words = [
-                    rev_vocab[idx.item()]
-                    for idx in pred_indices
-                    if idx.item() not in [0, 1]
-                ]
-                print("Generated: ", " ".join(pred_words))
-
-        except KeyboardInterrupt:
+    # Add words from embeddings to vocab
+    for word in word_vectors.index_to_key:
+        if len(vocab) < max_vocab_size:
+            vocab[word] = len(vocab)
+        else:
             break
-        except Exception as e:
-            print(f"Error: {e}")
+
+    return vocab, word_vectors
 
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str, default="data/sentences.txt")
-    parser.add_argument("--model_path", type=str, default="sequence_compressor.pt")
-    parser.add_argument("--vocab_path", type=str, default="vocab.json")
     parser.add_argument("--train", action="store_true")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # embeddings
+    vocab, word_vectors = load_pretrained_embeddings()
 
+    # model
+    model = Compressor(len(vocab), n_latent, max_len, vocab, word_vectors)
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"Using device: {device}")
+    model.to(device)
+    rev_vocab = {v: k for k, v in vocab.items()}
+
+    # train
     if args.train:
-        # Training mode
-        print("Building vocabulary...")
-        vocab = build_vocabulary(args.data_path)
-        with open(args.vocab_path, "w") as f:
-            json.dump(vocab, f)
+        dataset = TextDataset("data/sentences.txt", vocab, max_len)
+        loader = DataLoader(dataset, batch_size=batch_size)
+        opt = torch.optim.Adam(model.parameters())
+        rev_vocab = {v: k for k, v in vocab.items()}
 
-        # Create dataset and model
-        dataset = StreamingTextDataset(args.data_path, vocab, max_len=20)
-        train_loader = DataLoader(dataset, batch_size=64, num_workers=4)
+        print(f"training on {device}")
+        steps_per_epoch = dataset.count_lines() // batch_size
 
-        model = SequenceCompressor(len(vocab))
-        train_model(model, train_loader)
+        for epoch in range(n_epochs):
+            # Track stats
+            losses = []
+            accs = []
+            model.train()
 
-        # Save model
-        torch.save(model.state_dict(), args.model_path)
+            # Training loop with two progress bars
+            print(f"\nEpoch {epoch+1}/{n_epochs}:")
+            pbar = tqdm(enumerate(loader), total=steps_per_epoch, desc="train")
+            for it, batch in pbar:
+                # Forward pass
+                x = batch.to(device)
+                logits = model(x)
+                loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, model.vocab_size), x.view(-1), ignore_index=0
+                )
 
+                # Backward pass
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                # Track metrics
+                losses.append(loss.item())
+                pred = logits.argmax(dim=-1)
+                acc = (pred == x).float().mean().item()
+                accs.append(acc)
+
+                # Update progress bar
+                pbar.set_description(
+                    f"loss: {loss.item():.3f} | "
+                    f"avg_loss: {np.mean(losses[-100:]):.3f} | "
+                    f"avg_acc: {np.mean(accs[-100:]):.3f}"
+                )
+
+                # Sample every N steps
+                if it % 500 == 0:
+                    idx = torch.randint(0, len(x), (1,)).item()
+                    pred_tokens = [
+                        rev_vocab[i.item()] for i in pred[idx] if i.item() not in [0, 1]
+                    ]
+                    true_tokens = [
+                        rev_vocab[i.item()] for i in x[idx] if i.item() not in [0, 1]
+                    ]
+                    print(f"\nSample at step {it}:")
+                    print(f'pred: {" ".join(pred_tokens)}')
+                    print(f'true: {" ".join(true_tokens)}')
+
+            # Epoch summary
+            avg_loss = np.mean(losses)
+            avg_acc = np.mean(accs)
+            print(f"\nEpoch {epoch+1} summary:")
+            print(f"Average loss: {avg_loss:.4f}")
+            print(f"Average accuracy: {avg_acc:.4f}")
+
+            # Save checkpoint
+            ckpt = {
+                "model": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "vocab": vocab,
+                "epoch": epoch,
+                "loss": avg_loss,
+                "acc": avg_acc,
+            }
+            torch.save(ckpt, "model.pt")
+
+    # inference
     else:
-        # Inference mode
-        if not Path(args.model_path).exists():
-            print(f"No model found at {args.model_path}")
+        if not Path("model.pt").exists():
+            print("no checkpoint found, train first")
             return
 
-        # Load vocab and model
-        with open(args.vocab_path) as f:
-            vocab = json.load(f)
+        ckpt = torch.load("model.pt")
+        model.load_state_dict(ckpt["model"])
+        print("\nenter text (ctrl-c to exit)")
+        while True:
+            try:
+                text = input("> ")
+                tokens = text.strip().split()
+                if not tokens:
+                    continue
 
-        model = SequenceCompressor(len(vocab))
-        model.load_state_dict(torch.load(args.model_path))
-        model = model.to(device)
+                x = [vocab.get(t, vocab["<unk>"]) for t in tokens]
+                if len(x) > max_len:
+                    print(f"warning: trimming to {max_len} tokens")
+                    x = x[:max_len]
+                elif len(x) < max_len:
+                    x = x + [vocab["<pad>"]] * (max_len - len(x))
+                x = torch.tensor(x).unsqueeze(0).to(device)
 
-        # Start interactive session
-        interactive_inference(model, vocab, device)
+                with torch.no_grad():
+                    logits = model(x)
+                    probs = torch.softmax(logits[0], dim=-1)
+                    tokens = []
+                    for i in range(max_len):
+                        idx = probs[i].argmax().item()
+                        if idx == vocab["<pad>"]:
+                            break
+                        tokens.append(rev_vocab[idx])
+                print(" ".join(tokens))
+
+            except KeyboardInterrupt:
+                break
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ filelock==3.16.1
 fonttools==4.55.3
 frozenlist==1.5.0
 fsspec==2024.9.0
+gensim==4.3.3
 huggingface-hub==0.27.0
 idna==3.10
 Jinja2==3.1.5
@@ -26,7 +27,7 @@ multidict==6.1.0
 multiprocess==0.70.16
 networkx==3.4.2
 nltk==3.9.1
-numpy==2.2.1
+numpy==1.26.4
 packaging==24.2
 pandas==2.2.3
 pillow==11.0.0
@@ -38,14 +39,16 @@ pytz==2024.2
 PyYAML==6.0.2
 regex==2024.11.6
 requests==2.32.3
+scipy==1.13.1
 setuptools==75.6.0
 six==1.17.0
-soupsieve==2.6
+smart-open==7.1.0
 sympy==1.13.1
 torch==2.5.1
 tqdm==4.67.1
 typing_extensions==4.12.2
 tzdata==2024.2
 urllib3==2.3.0
+wrapt==1.17.0
 xxhash==3.5.0
 yarl==1.18.3
